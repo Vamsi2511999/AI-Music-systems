@@ -1,4 +1,11 @@
 numpy>=1.24
+pandas>=2.0
+seaborn>=0.13
 torch>=2.2
+transformers>=4.40
+sentencepiece>=0.2
+scipy>=1.11
 mirdata>=1.0
 matplotlib>=3.8
+librosa>=0.10
+soundfile>=0.12

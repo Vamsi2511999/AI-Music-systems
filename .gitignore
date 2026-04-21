@@ -1,0 +1,8 @@
+__pycache__/
+
+music_ai/artifacts/
+music_ai/data/
+music_ai/plots/
+music_ai/gpu_test.py
+.vscode/
+.codex

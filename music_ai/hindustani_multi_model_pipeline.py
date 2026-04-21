@@ -89,6 +89,8 @@ class GenerateConfig:
     audio_sample_rate: int = 22050
     seconds_per_note: float = 0.32
     drone_gain: float = 0.16
+    glide_ratio: float = 0.24
+    sympathetic_gain: float = 0.12
     grammar_bias_strength: float = 3.0
     seed: int = 42
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -1548,6 +1550,40 @@ def swara_to_hz(note: str, tonic_midi: int = 60) -> float:
     return midi_to_hz(swara_to_midi(note, tonic_midi))
 
 
+def smoothstep(values: np.ndarray) -> np.ndarray:
+    clipped = np.clip(values, 0.0, 1.0)
+    return clipped * clipped * (3.0 - 2.0 * clipped)
+
+
+def note_interval_semitones(start_hz: float, end_hz: float) -> float:
+    return 12.0 * math.log2(max(end_hz, 1e-6) / max(start_hz, 1e-6))
+
+
+def build_meend_frequency_curve(
+    freq: float,
+    next_freq: float | None,
+    length: int,
+    glide_ratio: float,
+) -> np.ndarray:
+    curve = np.full(length, freq, dtype=np.float64)
+    if next_freq is None or length <= 8:
+        return curve
+
+    interval = note_interval_semitones(freq, next_freq)
+    if abs(interval) < 0.75 or abs(interval) > 5.5:
+        return curve
+
+    glide_ratio = float(np.clip(glide_ratio, 0.0, 0.45))
+    glide_length = min(length - 1, max(8, int(length * glide_ratio)))
+    if glide_length <= 1:
+        return curve
+
+    # Interpolate on a log-frequency axis so the slide feels musical between swaras.
+    ramp = smoothstep(np.linspace(0.0, 1.0, glide_length, endpoint=True))
+    curve[-glide_length:] = freq * np.power(2.0, (interval / 12.0) * ramp)
+    return curve
+
+
 def encode_varlen(value: int) -> bytes:
     buffer = value & 0x7F
     out = bytearray()
@@ -1593,42 +1629,108 @@ def write_midi(tokens: Sequence[str], path: Path, note_ticks: int) -> None:
     path.write_bytes(header + track)
 
 
-def synth_lead_note(freq: float, duration: float, sample_rate: int) -> np.ndarray:
+def synth_lead_note(
+    freq: float,
+    duration: float,
+    sample_rate: int,
+    tonic_midi: int,
+    next_freq: float | None = None,
+    glide_ratio: float = 0.24,
+    sympathetic_gain: float = 0.12,
+) -> np.ndarray:
     length = max(1, int(sample_rate * duration))
-    t = np.linspace(0.0, duration, length, endpoint=False)
-    attack = max(1, int(0.08 * length))
-    release = max(1, int(0.18 * length))
-    sustain = max(1, length - attack - release)
+    t = np.arange(length, dtype=np.float64) / float(sample_rate)
+    freq_curve = build_meend_frequency_curve(freq, next_freq, length, glide_ratio)
+    micro_motion = 1.0 + 0.0025 * np.sin(2.0 * np.pi * 5.2 * t) * np.exp(-2.5 * t / max(duration, 1e-3))
+    phase = 2.0 * np.pi * np.cumsum(freq_curve * micro_motion) / float(sample_rate)
 
-    env = np.concatenate(
-        [
-            np.linspace(0.0, 1.0, attack, endpoint=False),
-            np.full(sustain, 0.92, dtype=np.float32),
-            np.linspace(0.92, 0.0, release, endpoint=True),
-        ]
-    )[:length]
-
-    vibrato = 0.003 * np.sin(2.0 * np.pi * 5.0 * t)
-    carrier = np.sin(2.0 * np.pi * freq * t * (1.0 + vibrato))
-    harmonic_2 = 0.35 * np.sin(2.0 * np.pi * 2.0 * freq * t)
-    harmonic_3 = 0.18 * np.sin(2.0 * np.pi * 3.0 * freq * t)
-    air = 0.02 * np.sin(2.0 * np.pi * 0.7 * t)
-    return (0.42 * (carrier + harmonic_2 + harmonic_3) * env + air * env).astype(np.float32)
-
-
-def synth_drone(total_duration: float, sample_rate: int, tonic_midi: int, gain: float) -> np.ndarray:
-    length = max(1, int(sample_rate * total_duration))
-    t = np.linspace(0.0, total_duration, length, endpoint=False)
-    sa = midi_to_hz(tonic_midi - 12)
-    pa = midi_to_hz(tonic_midi - 5)
-    upper_sa = midi_to_hz(tonic_midi)
-    slow_pulse = 0.82 + 0.18 * np.sin(2.0 * np.pi * 0.22 * t)
-    drone = (
-        0.55 * np.sin(2.0 * np.pi * sa * t)
-        + 0.28 * np.sin(2.0 * np.pi * pa * t)
-        + 0.20 * np.sin(2.0 * np.pi * upper_sa * t)
+    string = np.zeros(length, dtype=np.float64)
+    partials = (
+        (1.00, 1.00, 0.00),
+        (2.01, 0.58, 0.18),
+        (3.03, 0.31, 0.36),
+        (4.08, 0.19, 0.55),
+        (5.14, 0.11, 0.78),
+        (6.21, 0.07, 1.10),
     )
-    return (gain * slow_pulse * drone).astype(np.float32)
+    for harmonic, amplitude, phase_offset in partials:
+        string += amplitude * np.sin(phase * harmonic + phase_offset)
+
+    attack = min(length, max(2, int(0.006 * sample_rate)))
+    env = np.empty(length, dtype=np.float64)
+    env[:attack] = np.linspace(0.0, 1.0, attack, endpoint=False)
+    if attack < length:
+        tail = np.linspace(0.0, 1.0, length - attack, endpoint=True)
+        env[attack:] = 0.84 * np.exp(-3.8 * tail) + 0.12
+    release = min(length, max(8, int(0.18 * length)))
+    env[-release:] *= np.linspace(1.0, 0.0, release, endpoint=True) ** 1.6
+
+    noise = np.random.normal(0.0, 1.0, length)
+    noise = noise - np.concatenate(([0.0], noise[:-1]))
+    pluck = 0.16 * noise * np.exp(-85.0 * t)
+
+    jawari = np.tanh(1.35 * string)
+    brightness = np.exp(-10.0 * t / max(duration, 1e-3))
+    brilliance = 0.10 * brightness * np.sin(phase * 3.5 + 0.22)
+
+    sa = midi_to_hz(tonic_midi)
+    pa = midi_to_hz(tonic_midi + 7)
+    upper_sa = midi_to_hz(tonic_midi + 12)
+    resonance_env = np.exp(-4.0 * t / max(duration, 1e-3))
+    sympathetic = resonance_env * (
+        0.40 * np.sin(2.0 * np.pi * sa * t + 0.20)
+        + 0.22 * np.sin(2.0 * np.pi * pa * t + 0.55)
+        + 0.16 * np.sin(2.0 * np.pi * upper_sa * t + 0.80)
+        + 0.22 * np.sin(phase + 0.35)
+    )
+
+    tone = env * (0.44 * string + 0.30 * jawari + brilliance) + pluck + sympathetic_gain * sympathetic
+    peak = float(np.max(np.abs(tone))) if tone.size else 0.0
+    if peak > 1e-8:
+        tone = 0.72 * tone / peak
+    return tone.astype(np.float32)
+
+
+def synth_drone(total_samples: int, sample_rate: int, tonic_midi: int, gain: float) -> np.ndarray:
+    length = max(1, int(total_samples))
+    t = np.arange(length, dtype=np.float64) / float(sample_rate)
+    cycle_seconds = 2.7
+    string_specs = (
+        (midi_to_hz(tonic_midi - 12), 0.46, 0.00),
+        (midi_to_hz(tonic_midi - 12), 0.38, 0.68),
+        (midi_to_hz(tonic_midi - 5), 0.30, 1.34),
+        (midi_to_hz(tonic_midi), 0.22, 2.02),
+    )
+
+    drone = np.zeros(length, dtype=np.float64)
+    for freq, amplitude, offset in string_specs:
+        local_t = np.mod(t - offset, cycle_seconds)
+        env = np.exp(-3.8 * local_t)
+        base_phase = 2.0 * np.pi * freq * t
+        string = (
+            np.sin(base_phase)
+            + 0.32 * np.sin(2.01 * base_phase + 0.16)
+            + 0.18 * np.sin(3.02 * base_phase + 0.34)
+        )
+        jawari = np.tanh(1.20 * string)
+        drone += amplitude * env * (0.62 * string + 0.38 * jawari)
+
+    shimmer = 0.94 + 0.06 * np.sin(2.0 * np.pi * 0.12 * t)
+    return (gain * shimmer * drone).astype(np.float32)
+
+
+def append_with_crossfade(base: np.ndarray, segment: np.ndarray, crossfade_samples: int) -> np.ndarray:
+    if base.size == 0:
+        return segment.copy()
+    overlap = min(crossfade_samples, len(base), len(segment))
+    if overlap <= 0:
+        return np.concatenate([base, segment])
+
+    fade_out = np.linspace(1.0, 0.0, overlap, endpoint=True, dtype=np.float32)
+    fade_in = np.linspace(0.0, 1.0, overlap, endpoint=True, dtype=np.float32)
+    blended = base.copy()
+    blended[-overlap:] = blended[-overlap:] * fade_out + segment[:overlap] * fade_in
+    return np.concatenate([blended, segment[overlap:]])
 
 
 def synthesize_swara_audio(
@@ -1637,22 +1739,44 @@ def synthesize_swara_audio(
     seconds_per_note: float,
     tonic_midi: int = 60,
     drone_gain: float = 0.16,
+    glide_ratio: float = 0.24,
+    sympathetic_gain: float = 0.12,
 ) -> np.ndarray:
-    segments: List[np.ndarray] = []
+    lead = np.zeros(0, dtype=np.float32)
     silence = np.zeros(max(1, int(sample_rate * seconds_per_note * 0.45)), dtype=np.float32)
-    for token in tokens:
+    crossfade_samples = max(0, int(sample_rate * min(0.045, seconds_per_note * 0.18)))
+    previous_was_note = False
+    for index, token in enumerate(tokens):
         if token == SEP_TOKEN:
-            segments.append(silence.copy())
+            lead = np.concatenate([lead, silence.copy()])
+            previous_was_note = False
             continue
         if token not in SWARA_ORDER:
             continue
         freq = swara_to_hz(token, tonic_midi=tonic_midi)
-        segments.append(synth_lead_note(freq, seconds_per_note, sample_rate))
-    if not segments:
+        next_freq = None
+        if index + 1 < len(tokens):
+            next_token = tokens[index + 1]
+            if next_token in SWARA_ORDER and next_token != token:
+                next_freq = swara_to_hz(next_token, tonic_midi=tonic_midi)
+        segment = synth_lead_note(
+            freq,
+            seconds_per_note,
+            sample_rate,
+            tonic_midi=tonic_midi,
+            next_freq=next_freq,
+            glide_ratio=glide_ratio,
+            sympathetic_gain=sympathetic_gain,
+        )
+        if previous_was_note and crossfade_samples > 0:
+            lead = append_with_crossfade(lead, segment, crossfade_samples)
+        else:
+            lead = np.concatenate([lead, segment])
+        previous_was_note = True
+    if lead.size == 0:
         return np.zeros(sample_rate, dtype=np.float32)
-    lead = np.concatenate(segments)
-    drone = synth_drone(len(lead) / sample_rate, sample_rate, tonic_midi=tonic_midi, gain=drone_gain)
-    audio = lead + drone[: len(lead)]
+    drone = synth_drone(len(lead), sample_rate, tonic_midi=tonic_midi, gain=drone_gain)
+    audio = lead + drone
     peak = float(np.max(np.abs(audio))) if audio.size else 0.0
     if peak > 1e-8:
         audio = 0.92 * audio / peak
@@ -1665,6 +1789,8 @@ def write_audio_wav(
     sample_rate: int,
     seconds_per_note: float,
     drone_gain: float,
+    glide_ratio: float,
+    sympathetic_gain: float,
 ) -> None:
     audio = synthesize_swara_audio(
         tokens,
@@ -1672,6 +1798,8 @@ def write_audio_wav(
         seconds_per_note=seconds_per_note,
         tonic_midi=60,
         drone_gain=drone_gain,
+        glide_ratio=glide_ratio,
+        sympathetic_gain=sympathetic_gain,
     )
     pcm = np.int16(np.clip(audio, -1.0, 1.0) * 32767)
     with wave.open(str(path), "wb") as handle:
@@ -1875,6 +2003,8 @@ def generate_bundle(
                     sample_rate=config.audio_sample_rate,
                     seconds_per_note=config.seconds_per_note,
                     drone_gain=config.drone_gain,
+                    glide_ratio=config.glide_ratio,
+                    sympathetic_gain=config.sympathetic_gain,
                 )
             if config.write_plots and plt is not None:
                 label = f"{scope} | {raag} | {model_name}"
@@ -2000,6 +2130,8 @@ def build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--audio-sample-rate", type=int, default=22050)
     generate.add_argument("--seconds-per-note", type=float, default=0.32)
     generate.add_argument("--drone-gain", type=float, default=0.16)
+    generate.add_argument("--glide-ratio", type=float, default=0.24)
+    generate.add_argument("--sympathetic-gain", type=float, default=0.12)
     generate.add_argument("--grammar-bias-strength", type=float, default=3.0)
     generate.add_argument("--seed", type=int, default=42)
     generate.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -2062,6 +2194,8 @@ def main() -> None:
                 audio_sample_rate=args.audio_sample_rate,
                 seconds_per_note=args.seconds_per_note,
                 drone_gain=args.drone_gain,
+                glide_ratio=args.glide_ratio,
+                sympathetic_gain=args.sympathetic_gain,
                 grammar_bias_strength=args.grammar_bias_strength,
                 seed=args.seed,
                 device=args.device,
