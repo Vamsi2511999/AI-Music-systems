@@ -1045,6 +1045,8 @@ def plot_training_strategy_summary_dashboard(df: pd.DataFrame, output_dir: Path)
         ax=ax_radar,
         palette=TRAINING_PALETTE,
     )
+    if ax_radar.legend_ is not None:
+        ax_radar.legend_.remove()
 
     ax_kl = fig.add_subplot(2, 2, 2)
     plot_bar(
@@ -1060,6 +1062,8 @@ def plot_training_strategy_summary_dashboard(df: pd.DataFrame, output_dir: Path)
         order=ordered_models(summary["model"].unique()),
         hue_order=TRAINING_ORDER,
     )
+    if ax_kl.legend_ is not None:
+        ax_kl.legend_.remove()
 
     ax_creativity = fig.add_subplot(2, 2, 3)
     plot_bar(
@@ -1075,6 +1079,8 @@ def plot_training_strategy_summary_dashboard(df: pd.DataFrame, output_dir: Path)
         order=ordered_models(summary["model"].unique()),
         hue_order=TRAINING_ORDER,
     )
+    if ax_creativity.legend_ is not None:
+        ax_creativity.legend_.remove()
 
     ax_heatmap = fig.add_subplot(2, 2, 4)
     if improvement.empty:
@@ -1090,6 +1096,10 @@ def plot_training_strategy_summary_dashboard(df: pd.DataFrame, output_dir: Path)
             center=0.0,
         )
 
+    handles, labels = ax_kl.get_legend_handles_labels()
+    if handles:
+        fig.legend(handles, labels, title="Training Strategy", loc="upper center", ncol=len(labels), frameon=True, bbox_to_anchor=(0.5, 0.98), fontsize=10)
+    
     fig.suptitle("Training Strategy Summary Dashboard", fontsize=18, fontweight="bold", y=1.02)
     return save_figure(fig, output_dir / "training_strategy_summary_dashboard.png")
 
