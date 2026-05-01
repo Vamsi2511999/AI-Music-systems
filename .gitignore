@@ -1,6 +1,8 @@
 __pycache__/
 
-music_ai/artifacts/
+music_ai/artifacts/generated/
+music_ai/artifacts/prepared/
+music_ai/artifacts/models/
 music_ai/data/
 music_ai/plots/
 music_ai/gpu_test.py
